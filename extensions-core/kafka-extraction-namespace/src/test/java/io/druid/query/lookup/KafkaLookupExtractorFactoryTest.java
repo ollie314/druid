@@ -28,12 +28,13 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.metamx.common.StringUtils;
 import io.druid.jackson.DefaultObjectMapper;
-import io.druid.server.namespace.cache.NamespaceExtractionCacheManager;
+import io.druid.server.lookup.namespace.cache.NamespaceExtractionCacheManager;
 import kafka.consumer.ConsumerIterator;
 import kafka.consumer.KafkaStream;
 import kafka.consumer.TopicFilter;
 import kafka.javaapi.consumer.ConsumerConnector;
 import org.easymock.EasyMock;
+import org.easymock.IAnswer;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Rule;
@@ -46,6 +47,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static io.druid.query.lookup.KafkaLookupExtractorFactory.DEFAULT_STRING_DECODER;
@@ -72,7 +74,7 @@ public class KafkaLookupExtractorFactoryTest
           Object valueId, DeserializationContext ctxt, BeanProperty forProperty, Object beanInstance
       )
       {
-        if ("io.druid.server.namespace.cache.NamespaceExtractionCacheManager".equals(valueId)) {
+        if ("io.druid.server.lookup.namespace.cache.NamespaceExtractionCacheManager".equals(valueId)) {
           return cacheManager;
         } else {
           return null;
@@ -195,6 +197,9 @@ public class KafkaLookupExtractorFactoryTest
         TOPIC,
         DEFAULT_PROPERTIES
     );
+
+    Assert.assertTrue(factory.replaces(null));
+
     Assert.assertTrue(factory.replaces(new MapLookupExtractorFactory(ImmutableMap.<String, String>of(), false)));
     Assert.assertFalse(factory.replaces(factory));
     Assert.assertFalse(factory.replaces(new KafkaLookupExtractorFactory(
@@ -268,8 +273,18 @@ public class KafkaLookupExtractorFactoryTest
             .andReturn(new ConcurrentHashMap<String, String>())
             .once();
     EasyMock.expect(cacheManager.delete(EasyMock.anyString())).andReturn(true).once();
+
+    final AtomicBoolean threadWasInterrupted = new AtomicBoolean(false);
     consumerConnector.shutdown();
-    EasyMock.expectLastCall().once();
+    EasyMock.expectLastCall().andAnswer(new IAnswer<Object>()
+    {
+      @Override
+      public Object answer() throws Throwable {
+        threadWasInterrupted.set(Thread.currentThread().isInterrupted());
+        return null;
+      }
+    }).once();
+
     EasyMock.replay(cacheManager, kafkaStream, consumerConnector, consumerIterator);
     final KafkaLookupExtractorFactory factory = new KafkaLookupExtractorFactory(
         cacheManager,
@@ -285,9 +300,12 @@ public class KafkaLookupExtractorFactoryTest
         return consumerConnector;
       }
     };
+
     Assert.assertTrue(factory.start());
     Assert.assertTrue(factory.close());
     Assert.assertTrue(factory.getFuture().isDone());
+    Assert.assertFalse(threadWasInterrupted.get());
+
     EasyMock.verify(cacheManager);
   }
 
@@ -505,6 +523,31 @@ public class KafkaLookupExtractorFactoryTest
         TOPIC,
         DEFAULT_PROPERTIES
     ).get();
+  }
+
+  @Test
+  public void testSerDe() throws Exception
+  {
+    final NamespaceExtractionCacheManager cacheManager = EasyMock.createStrictMock(NamespaceExtractionCacheManager.class);
+    final String kafkaTopic = "some_topic";
+    final Map<String, String> kafkaProperties = ImmutableMap.of("some_key", "some_value");
+    final long connectTimeout = 999;
+    final boolean injective = true;
+    final KafkaLookupExtractorFactory factory = new KafkaLookupExtractorFactory(
+        cacheManager,
+        kafkaTopic,
+        kafkaProperties,
+        connectTimeout,
+        injective
+    );
+    final KafkaLookupExtractorFactory otherFactory = mapper.readValue(
+        mapper.writeValueAsString(factory),
+        KafkaLookupExtractorFactory.class
+    );
+    Assert.assertEquals(kafkaTopic, otherFactory.getKafkaTopic());
+    Assert.assertEquals(kafkaProperties, otherFactory.getKafkaProperties());
+    Assert.assertEquals(connectTimeout, otherFactory.getConnectTimeout());
+    Assert.assertEquals(injective, otherFactory.isInjective());
   }
 
   @Test

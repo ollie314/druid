@@ -37,7 +37,16 @@ import com.metamx.common.StringUtils;
 import com.metamx.common.logger.Logger;
 import io.druid.concurrent.Execs;
 import io.druid.query.extraction.MapLookupExtractor;
-import io.druid.server.namespace.cache.NamespaceExtractionCacheManager;
+import io.druid.server.lookup.namespace.cache.NamespaceExtractionCacheManager;
+import kafka.consumer.ConsumerConfig;
+import kafka.consumer.KafkaStream;
+import kafka.consumer.Whitelist;
+import kafka.javaapi.consumer.ConsumerConnector;
+import kafka.message.MessageAndMetadata;
+import kafka.serializer.Decoder;
+
+import javax.annotation.Nullable;
+import javax.validation.constraints.Min;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
@@ -52,16 +61,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
-import javax.annotation.Nullable;
-import javax.validation.constraints.Min;
-import javax.ws.rs.GET;
-import javax.ws.rs.core.Response;
-import kafka.consumer.ConsumerConfig;
-import kafka.consumer.KafkaStream;
-import kafka.consumer.Whitelist;
-import kafka.javaapi.consumer.ConsumerConnector;
-import kafka.message.MessageAndMetadata;
-import kafka.serializer.Decoder;
 
 @JsonTypeName("kafka")
 public class KafkaLookupExtractorFactory implements LookupExtractorFactory
@@ -95,7 +94,7 @@ public class KafkaLookupExtractorFactory implements LookupExtractorFactory
   private final long connectTimeout;
 
   @JsonProperty
-  private final boolean isOneToOne;
+  private final boolean injective;
 
   @JsonCreator
   public KafkaLookupExtractorFactory(
@@ -103,7 +102,7 @@ public class KafkaLookupExtractorFactory implements LookupExtractorFactory
       @JsonProperty("kafkaTopic") final String kafkaTopic,
       @JsonProperty("kafkaProperties") final Map<String, String> kafkaProperties,
       @JsonProperty("connectTimeout") @Min(0) long connectTimeout,
-      @JsonProperty("isOneToOne") boolean isOneToOne
+      @JsonProperty("injective") boolean injective
   )
   {
     this.kafkaTopic = Preconditions.checkNotNull(kafkaTopic, "kafkaTopic required");
@@ -114,7 +113,7 @@ public class KafkaLookupExtractorFactory implements LookupExtractorFactory
     ));
     this.cacheManager = cacheManager;
     this.connectTimeout = connectTimeout;
-    this.isOneToOne = isOneToOne;
+    this.injective = injective;
   }
 
   public KafkaLookupExtractorFactory(
@@ -141,9 +140,9 @@ public class KafkaLookupExtractorFactory implements LookupExtractorFactory
     return connectTimeout;
   }
 
-  public boolean isOneToOne()
+  public boolean isInjective()
   {
-    return isOneToOne;
+    return injective;
   }
 
   @Override
@@ -193,7 +192,7 @@ public class KafkaLookupExtractorFactory implements LookupExtractorFactory
             @Override
             public void run()
             {
-              while (!executorService.isShutdown() && !Thread.currentThread().isInterrupted()) {
+              while (!executorService.isShutdown()) {
                 final ConsumerConnector consumerConnector = buildConnector(kafkaProperties);
                 try {
                   final List<KafkaStream<String, String>> streams = consumerConnector.createMessageStreamsByFilter(
@@ -269,7 +268,8 @@ public class KafkaLookupExtractorFactory implements LookupExtractorFactory
         }
       }
       catch (InterruptedException | ExecutionException | TimeoutException e) {
-        if (!future.isDone() && !future.cancel(true) && !future.isDone()) {
+        executorService.shutdown();
+        if (!future.isDone() && !future.cancel(false)) {
           LOG.warn("Could not cancel kafka listening thread");
         }
         LOG.error(e, "Failed to start kafka extraction factory");
@@ -299,10 +299,10 @@ public class KafkaLookupExtractorFactory implements LookupExtractorFactory
         return !started.get();
       }
       started.set(false);
-      executorService.shutdownNow();
+      executorService.shutdown();
       final ListenableFuture<?> future = this.future;
       if (future != null) {
-        if (!future.isDone() && !future.cancel(true) && !future.isDone()) {
+        if (!future.isDone() && !future.cancel(false)) {
           LOG.error("Error cancelling future for topic [%s]", getKafkaTopic());
           return false;
         }
@@ -322,11 +322,7 @@ public class KafkaLookupExtractorFactory implements LookupExtractorFactory
       return false;
     }
 
-    if (other == null) {
-      return false;
-    }
-
-    if (getClass() != other.getClass()) {
+    if (other == null || getClass() != other.getClass()) {
       return true;
     }
 
@@ -335,7 +331,7 @@ public class KafkaLookupExtractorFactory implements LookupExtractorFactory
     return !(getKafkaTopic().equals(that.getKafkaTopic())
              && getKafkaProperties().equals(that.getKafkaProperties())
              && getConnectTimeout() == that.getConnectTimeout()
-             && isOneToOne() == that.isOneToOne()
+             && isInjective() == that.isInjective()
     );
   }
 
@@ -343,7 +339,7 @@ public class KafkaLookupExtractorFactory implements LookupExtractorFactory
   @Override
   public LookupIntrospectHandler getIntrospectHandler()
   {
-    return new KafkaLookupExtractorIntrospectionHandler();
+    return new KafkaLookupExtractorIntrospectionHandler(this);
   }
 
   @Override
@@ -351,7 +347,7 @@ public class KafkaLookupExtractorFactory implements LookupExtractorFactory
   {
     final Map<String, String> map = Preconditions.checkNotNull(mapRef.get(), "Not started");
     final long startCount = doubleEventCount.get();
-    return new MapLookupExtractor(map, isOneToOne())
+    return new MapLookupExtractor(map, isInjective())
     {
       @Override
       public byte[] getCacheKey()
@@ -404,20 +400,5 @@ public class KafkaLookupExtractorFactory implements LookupExtractorFactory
   ListenableFuture<?> getFuture()
   {
     return future;
-  }
-
-
-  class KafkaLookupExtractorIntrospectionHandler implements LookupIntrospectHandler
-  {
-    @GET
-    public Response getActive()
-    {
-      final ListenableFuture<?> future = getFuture();
-      if (future != null && !future.isDone()) {
-        return Response.ok().build();
-      } else {
-        return Response.status(Response.Status.GONE).build();
-      }
-    }
   }
 }
