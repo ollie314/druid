@@ -24,9 +24,10 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.io.ByteSink;
 import com.google.common.io.ByteSource;
 import com.google.inject.Inject;
-import com.metamx.common.CompressionUtils;
-import com.metamx.common.logger.Logger;
+
 import io.druid.common.utils.UUIDUtils;
+import io.druid.java.util.common.CompressionUtils;
+import io.druid.java.util.common.logger.Logger;
 import io.druid.segment.SegmentUtils;
 import io.druid.segment.loading.DataSegmentPusher;
 import io.druid.segment.loading.DataSegmentPusherUtil;
@@ -103,9 +104,10 @@ public class HdfsDataSegmentPusher implements DataSegmentPusher
     final DataSegment dataSegment;
     try (FSDataOutputStream out = fs.create(tmpFile)) {
       size = CompressionUtils.zip(inDir, out);
-      Path outDir = new Path(String.format("%s/%s", config.getStorageDirectory(), storageDir));
+      final Path outFile = new Path(String.format("%s/%s/index.zip", config.getStorageDirectory(), storageDir));
+      final Path outDir = outFile.getParent();
       dataSegment = createDescriptorFile(
-          segment.withLoadSpec(makeLoadSpec(new Path(String.format("%s/%s", outDir.toUri().getPath(), "index.zip"))))
+          segment.withLoadSpec(makeLoadSpec(outFile))
                  .withSize(size)
                  .withBinaryVersion(SegmentUtils.getVersionFromDir(inDir)),
           tmpFile.getParent(),
@@ -150,7 +152,7 @@ public class HdfsDataSegmentPusher implements DataSegmentPusher
 
   private ImmutableMap<String, Object> makeLoadSpec(Path outFile)
   {
-    return ImmutableMap.<String, Object>of("type", "hdfs", "path", outFile.toString());
+    return ImmutableMap.<String, Object>of("type", "hdfs", "path", outFile.toUri().toString());
   }
 
   private static class HdfsOutputStreamSupplier extends ByteSink

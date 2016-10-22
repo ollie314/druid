@@ -32,6 +32,7 @@ import org.joda.time.Interval;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.ExpectedException;
 import org.junit.rules.TemporaryFolder;
 
 import java.io.File;
@@ -44,8 +45,33 @@ public class HdfsDataSegmentPusherTest
   @Rule
   public final TemporaryFolder tempFolder = new TemporaryFolder();
 
+  @Rule
+  public final ExpectedException expectedException = ExpectedException.none();
+
   @Test
-  public void testPush() throws Exception
+  public void testPushWithScheme() throws Exception
+  {
+    testUsingScheme("file");
+  }
+
+  @Test
+  public void testPushWithBadScheme() throws Exception
+  {
+    expectedException.expect(IOException.class);
+    expectedException.expectMessage("No FileSystem for scheme: xyzzy");
+    testUsingScheme("xyzzy");
+
+    // Not reached
+    Assert.assertTrue(false);
+  }
+
+  @Test
+  public void testPushWithoutScheme() throws Exception
+  {
+    testUsingScheme(null);
+  }
+
+  private void testUsingScheme(final String scheme) throws Exception
   {
     Configuration conf = new Configuration(true);
 
@@ -58,8 +84,13 @@ public class HdfsDataSegmentPusherTest
     final long size = data.length;
 
     HdfsDataSegmentPusherConfig config = new HdfsDataSegmentPusherConfig();
+    final File storageDirectory = tempFolder.newFolder();
 
-    config.setStorageDirectory(tempFolder.newFolder().getAbsolutePath());
+    config.setStorageDirectory(
+        scheme != null
+        ? String.format("%s://%s", scheme, storageDirectory.getAbsolutePath())
+        : storageDirectory.getAbsolutePath()
+    );
     HdfsDataSegmentPusher pusher = new HdfsDataSegmentPusher(config, conf, new DefaultObjectMapper());
 
     DataSegment segmentToPush = new DataSegment(
@@ -82,20 +113,21 @@ public class HdfsDataSegmentPusherTest
         "type",
         "hdfs",
         "path",
-        String.format("%s/%s/index.zip",
-                      config.getStorageDirectory(),
-                      DataSegmentPusherUtil.getHdfsStorageDir(segmentToPush)
+        String.format(
+            "%s/%s/index.zip",
+            config.getStorageDirectory(),
+            DataSegmentPusherUtil.getHdfsStorageDir(segmentToPush)
         )
     ), segment.getLoadSpec());
     // rename directory after push
-    final String storageDir = DataSegmentPusherUtil.getHdfsStorageDir(segment);
-    File indexFile = new File(String.format("%s/%s/index.zip", config.getStorageDirectory(), storageDir));
+    final String segmentPath = DataSegmentPusherUtil.getHdfsStorageDir(segment);
+    File indexFile = new File(String.format("%s/%s/index.zip", storageDirectory, segmentPath));
     Assert.assertTrue(indexFile.exists());
-    File descriptorFile = new File(String.format("%s/%s/descriptor.json", config.getStorageDirectory(), storageDir));
+    File descriptorFile = new File(String.format("%s/%s/descriptor.json", storageDirectory, segmentPath));
     Assert.assertTrue(descriptorFile.exists());
 
     // push twice will fail and temp dir cleaned
-    File outDir = new File(String.format("%s/%s", config.getStorageDirectory(), storageDir));
+    File outDir = new File(String.format("%s/%s", config.getStorageDirectory(), segmentPath));
     outDir.setReadOnly();
     try {
       pusher.push(segmentDir, segmentToPush);
